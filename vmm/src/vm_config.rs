@@ -471,12 +471,54 @@ pub struct BalloonConfig {
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, Default)]
 pub struct PvmemcontrolConfig {}
 
+#[cfg(feature = "native_virtiofs")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, Default)]
+pub enum FsCachePolicy {
+    Always,
+    #[default]
+    Auto,
+    Never,
+}
+
+#[cfg(feature = "native_virtiofs")]
+impl FromStr for FsCachePolicy {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "always" => Ok(FsCachePolicy::Always),
+            "auto" => Ok(FsCachePolicy::Auto),
+            "never" => Ok(FsCachePolicy::Never),
+            _ => Err(format!("Invalid cache policy: {s}")),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum FsBackendConfig {
+    VhostUser {
+        socket: PathBuf,
+    },
+    #[cfg(feature = "native_virtiofs")]
+    Builtin {
+        shared_dir: PathBuf,
+        #[serde(default)]
+        cache_size: u64,
+        #[serde(default)]
+        cache_policy: FsCachePolicy,
+        #[serde(default)]
+        writeback: bool,
+    },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct FsConfig {
     #[serde(flatten)]
     pub pci_common: PciDeviceCommonConfig,
     pub tag: String,
-    pub socket: PathBuf,
+    #[serde(flatten)]
+    pub backend: FsBackendConfig,
     #[serde(default = "default_fsconfig_num_queues")]
     pub num_queues: usize,
     #[serde(default = "default_fsconfig_queue_size")]
@@ -493,7 +535,15 @@ pub fn default_fsconfig_queue_size() -> u16 {
 
 impl ApplyLandlock for FsConfig {
     fn apply_landlock(&self, landlock: &mut Landlock) -> LandlockResult<()> {
-        landlock.add_rule_with_access(&self.socket, "rw")?;
+        match &self.backend {
+            FsBackendConfig::VhostUser { socket } => {
+                landlock.add_rule_with_access(socket, "rw")?;
+            }
+            #[cfg(feature = "native_virtiofs")]
+            FsBackendConfig::Builtin { shared_dir, .. } => {
+                landlock.add_rule_with_access(shared_dir, "rw")?;
+            }
+        }
         Ok(())
     }
 }

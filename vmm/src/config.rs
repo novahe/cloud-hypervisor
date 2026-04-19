@@ -49,6 +49,12 @@ pub enum Error {
     /// Filesystem socket is missing
     #[error("Error parsing --fs: socket missing")]
     ParseFsSockMissing,
+    /// Filesystem backend is missing (either socket or shared_dir must be specified or both specified)
+    #[error("Error parsing --fs: either socket or shared_dir must be specified")]
+    ParseFsBackendMissing,
+    /// Filesystem native backend is disabled
+    #[error("Error parsing --fs: shared_dir requires 'native_virtiofs' feature")]
+    ParseFsNativeDisabled,
     /// Generic vhost-user virtio ID is invalid
     #[error(
         "Error parsing --generic-vhost-user: virtio ID {0:?} invalid (leading zeros or unknown string)"
@@ -238,6 +244,12 @@ pub enum ValidationError {
     /// Using vhost user requires shared memory
     #[error("Using vhost-user requires using shared memory or huge pages")]
     VhostUserRequiresSharedMemory,
+    /// Using builtin virtio-fs with DAX requires shared memory
+    #[error("Using builtin virtio-fs with DAX (cache_size > 0) requires using shared memory")]
+    FsBuiltinDaxRequiresSharedMemory,
+    /// Builtin virtio-fs DAX is not implemented yet
+    #[error("Using builtin virtio-fs with DAX (cache_size > 0) is not supported yet")]
+    FsBuiltinDaxUnsupported,
     /// No socket provided for vhost_use
     #[error("No socket provided when using vhost-user")]
     VhostUserMissingSocket,
@@ -1922,8 +1934,9 @@ impl GenericVhostUserConfig {
 
 impl FsConfig {
     pub const SYNTAX: &'static str = "virtio-fs parameters \
-    \"tag=<tag_name>,socket=<socket_path>,num_queues=<number_of_queues>,\
-    queue_size=<size_of_each_queue>,id=<device_id>,\
+    \"tag=<tag_name>,socket=<socket_path>,shared_dir=<directory_path>,\
+    cache=always|auto|never,cache_size=<cache_size_in_bytes>,writeback=on|off,\
+    num_queues=<number_of_queues>,queue_size=<size_of_each_queue>,id=<device_id>,\
     pci_segment=<segment_id>,pci_device_id=<pci_slot>\"";
 
     pub fn parse(fs: &str) -> Result<Self> {
@@ -1933,6 +1946,10 @@ impl FsConfig {
             .add("queue_size")
             .add("num_queues")
             .add("socket")
+            .add("shared_dir")
+            .add("cache")
+            .add("cache_size")
+            .add("writeback")
             .add_all(PciDeviceCommonConfig::OPTIONS);
         parser.parse(fs).map_err(Error::ParseFileSystem)?;
 
@@ -1940,7 +1957,40 @@ impl FsConfig {
         if tag.len() > virtio_devices::vhost_user::VIRTIO_FS_TAG_LEN {
             return Err(Error::ParseFsTagTooLong);
         }
-        let socket = PathBuf::from(parser.get("socket").ok_or(Error::ParseFsSockMissing)?);
+
+        let socket = parser.get("socket").map(PathBuf::from);
+        let shared_dir = parser.get("shared_dir").map(PathBuf::from);
+
+        let backend = match (socket, shared_dir) {
+            (Some(socket), None) => FsBackendConfig::VhostUser { socket },
+            #[cfg(feature = "native_virtiofs")]
+            (None, Some(shared_dir)) => {
+                let cache_size = parser
+                    .convert::<ByteSized>("cache_size")
+                    .map_err(Error::ParseFileSystem)?
+                    .map(|b| b.0)
+                    .unwrap_or(0);
+                let cache_policy = parser
+                    .convert::<FsCachePolicy>("cache")
+                    .map_err(Error::ParseFileSystem)?
+                    .unwrap_or_default();
+                let writeback = parser
+                    .convert::<Toggle>("writeback")
+                    .map_err(Error::ParseFileSystem)?
+                    .unwrap_or(Toggle(false))
+                    .0;
+
+                FsBackendConfig::Builtin {
+                    shared_dir,
+                    cache_size,
+                    cache_policy,
+                    writeback,
+                }
+            }
+            #[cfg(not(feature = "native_virtiofs"))]
+            (None, Some(_)) => return Err(Error::ParseFsNativeDisabled),
+            _ => return Err(Error::ParseFsBackendMissing),
+        };
 
         let queue_size = parser
             .convert("queue_size")
@@ -1956,7 +2006,7 @@ impl FsConfig {
         Ok(FsConfig {
             pci_common,
             tag,
-            socket,
+            backend,
             num_queues,
             queue_size,
         })
@@ -1968,6 +2018,16 @@ impl FsConfig {
                 self.num_queues,
                 vm_config.cpus.boot_vcpus as usize,
             ));
+        }
+
+        #[cfg(feature = "native_virtiofs")]
+        if let FsBackendConfig::Builtin { cache_size, .. } = &self.backend {
+            if *cache_size > 0 && !vm_config.memory.shared {
+                return Err(ValidationError::FsBuiltinDaxRequiresSharedMemory);
+            }
+            if *cache_size > 0 {
+                return Err(ValidationError::FsBuiltinDaxUnsupported);
+            }
         }
 
         if self.pci_common.iommu {
@@ -4153,8 +4213,10 @@ mod unit_tests {
     fn fs_fixture() -> FsConfig {
         FsConfig {
             pci_common: PciDeviceCommonConfig::default(),
-            socket: PathBuf::from("/tmp/sock"),
             tag: "mytag".to_owned(),
+            backend: FsBackendConfig::VhostUser {
+                socket: PathBuf::from("/tmp/sock"),
+            },
             num_queues: 1,
             queue_size: 1024,
         }
@@ -4162,7 +4224,7 @@ mod unit_tests {
 
     #[test]
     fn test_parse_fs() -> Result<()> {
-        // "tag" and "socket" must be supplied
+        // "tag" and "socket"|"shared_dir" must be supplied
         FsConfig::parse("").unwrap_err();
         FsConfig::parse("tag=mytag").unwrap_err();
         FsConfig::parse("socket=/tmp/sock").unwrap_err();
@@ -4175,6 +4237,52 @@ mod unit_tests {
                 ..fs_fixture()
             }
         );
+
+        #[cfg(feature = "native_virtiofs")]
+        {
+            // Test builtin backend
+            assert_eq!(
+                FsConfig::parse("tag=mytag,shared_dir=/srv/share")?,
+                FsConfig {
+                    backend: FsBackendConfig::Builtin {
+                        shared_dir: PathBuf::from("/srv/share"),
+                        cache_size: 0,
+                        cache_policy: FsCachePolicy::Auto,
+                        writeback: false,
+                    },
+                    ..fs_fixture()
+                }
+            );
+
+            assert_eq!(
+                FsConfig::parse(
+                    "tag=mytag,shared_dir=/srv/share,cache=always,cache_size=2G,writeback=on"
+                )?,
+                FsConfig {
+                    backend: FsBackendConfig::Builtin {
+                        shared_dir: PathBuf::from("/srv/share"),
+                        cache_size: 2 * 1024 * 1024 * 1024,
+                        cache_policy: FsCachePolicy::Always,
+                        writeback: true,
+                    },
+                    ..fs_fixture()
+                }
+            );
+
+            // Validation test for DAX requires shared memory
+            let config = FsConfig::parse("tag=mytag,shared_dir=/srv/share,cache_size=1G")?;
+            let mut vm_config = VmConfig::default();
+            vm_config.memory.shared = false;
+            assert!(matches!(
+                config.validate(&vm_config),
+                Err(ValidationError::FsBuiltinDaxRequiresSharedMemory)
+            ));
+            vm_config.memory.shared = true;
+            assert!(matches!(
+                config.validate(&vm_config),
+                Err(ValidationError::FsBuiltinDaxUnsupported)
+            ));
+        }
 
         Ok(())
     }

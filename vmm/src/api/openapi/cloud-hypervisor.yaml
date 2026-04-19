@@ -1096,7 +1096,6 @@ components:
       required:
         - num_queues
         - queue_size
-        - socket
         - tag
       type: object
       properties:
@@ -1104,6 +1103,21 @@ components:
           type: string
         socket:
           type: string
+          description: Path to the vhost-user virtio-fs UNIX domain socket.
+        shared_dir:
+          type: string
+          description: Host directory exported by the builtin virtio-fs backend. Requires a Cloud Hypervisor build with the `native_virtiofs` feature enabled; otherwise requests using this field are rejected.
+        cache:
+          type: string
+          enum: ["Always", "Auto", "Never"]
+          description: Cache policy for the builtin virtio-fs backend. Requires a Cloud Hypervisor build with the `native_virtiofs` feature enabled; otherwise requests using this field are rejected.
+        cache_size:
+          type: integer
+          format: int64
+          description: DAX cache size in bytes for the builtin virtio-fs backend. Requires a Cloud Hypervisor build with the `native_virtiofs` feature enabled; otherwise requests using this field are rejected.
+        writeback:
+          type: boolean
+          description: Enables writeback caching for the builtin virtio-fs backend. Requires a Cloud Hypervisor build with the `native_virtiofs` feature enabled; otherwise requests using this field are rejected.
         num_queues:
           type: integer
           default: 1

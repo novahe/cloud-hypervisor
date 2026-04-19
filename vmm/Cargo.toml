@@ -40,6 +40,7 @@ sev_snp = [
 ]
 tdx = ["arch/tdx", "hypervisor/tdx"]
 tracing = ["tracer/tracing"]
+native_virtiofs = ["virtio-devices/native_virtiofs"]
 
 [dependencies]
 acpi_tables = { workspace = true }

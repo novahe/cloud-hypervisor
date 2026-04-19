@@ -58,6 +58,7 @@ pvmemcontrol = ["vmm/pvmemcontrol"]
 sev_snp = ["igvm", "mshv", "vmm/sev_snp"]
 tdx = ["vmm/tdx"]
 tracing = ["tracer/tracing", "vmm/tracing"]
+native_virtiofs = ["vmm/native_virtiofs"]
 
 [lints]
 workspace = true
