@@ -8,14 +8,17 @@ use std::ops::Deref;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
-use std::sync::{Arc, Barrier, Mutex, result};
+use std::sync::{Arc, Barrier, Mutex};
+use std::result;
+use std::time::Duration;
 
 use anyhow::anyhow;
 use fuse_backend_rs::api::server::Server;
-use fuse_backend_rs::api::{
-    Context, CreateIn, DirEntry, Entry, FileSystem, Handle, OpenOptions, Vfs, VfsOptions,
+use fuse_backend_rs::api::filesystem::{
+    Context, DirEntry, Entry, FileSystem, OpenOptions,
     ZeroCopyReader, ZeroCopyWriter,
 };
+use fuse_backend_rs::api::{BackendFileSystem, Vfs, VfsOptions};
 use fuse_backend_rs::passthrough::{
     CachePolicy as BackendCachePolicy, Config as PassthroughConfig, PassthroughFs,
 };
@@ -24,13 +27,13 @@ use log::{error, info};
 use seccompiler::SeccompAction;
 use serde::{Deserialize, Serialize};
 use virtio_bindings::virtio_config::VIRTIO_F_VERSION_1;
-use virtio_queue::{Queue, QueueOwnedT};
-use vm_memory::{ByteValued, GuestMemoryAtomic};
+use virtio_queue::{Queue, QueueT};
+use vm_memory::{ByteValued, GuestAddressSpace, GuestMemoryAtomic};
 use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
 use vmm_sys_util::eventfd::EventFd;
 
 use super::{
-    ActivateError, ActivateResult, EPOLL_HELPER_EVENT_LAST, EpollHelper, EpollHelperError,
+    ActivateResult, EPOLL_HELPER_EVENT_LAST, EpollHelper, EpollHelperError,
     EpollHelperHandler, Error as DeviceError, VirtioCommon, VirtioDevice, VirtioDeviceType,
     VirtioInterrupt, VirtioInterruptType, VirtioSharedMemoryList,
 };
@@ -43,11 +46,20 @@ const QUEUE_AVAIL_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 1;
 
 pub const VIRTIO_FS_TAG_LEN: usize = 36;
 
-#[derive(Copy, Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Copy, Clone, Debug)]
 #[repr(C, packed)]
 pub struct VirtioFsConfig {
     pub tag: [u8; VIRTIO_FS_TAG_LEN],
     pub num_request_queues: u32,
+}
+
+impl Default for VirtioFsConfig {
+    fn default() -> Self {
+        VirtioFsConfig {
+            tag: [0u8; VIRTIO_FS_TAG_LEN],
+            num_request_queues: 0,
+        }
+    }
 }
 
 unsafe impl ByteValued for VirtioFsConfig {}
@@ -121,13 +133,13 @@ impl<F: FileSystem + Send + Sync> TrackingFileSystem<F> {
         h2g.insert(host_inode, guest_inode);
     }
 
-    fn map_guest_handle(&self, guest_handle: u64) -> io::Result<u64> {
+    fn map_guest_handle(&self, guest_handle: u64) -> u64 {
         self.guest_to_host_handles
             .lock()
             .unwrap()
             .get(&guest_handle)
             .cloned()
-            .ok_or_else(|| io::Error::from_raw_os_error(libc::EBADF))
+            .unwrap_or(guest_handle)
     }
 
     fn map_host_handle(&self, host_handle: u64, guest_handle: u64) {
@@ -287,36 +299,32 @@ impl<F: FileSystem + Send + Sync> TrackingFileSystem<F> {
     }
 }
 
-impl<F: FileSystem + Send + Sync> FileSystem for TrackingFileSystem<F> {
-    type Inode = F::Inode;
-    type Handle = F::Handle;
-
+impl<F: FileSystem<Inode = u64, Handle = u64> + BackendFileSystem + Send + Sync + 'static> FileSystem for TrackingFileSystem<F> {
+    type Inode = u64;
+    type Handle = u64;
     fn lookup(&self, ctx: &Context, parent: Self::Inode, name: &CStr) -> io::Result<Entry> {
-        let host_parent = self.map_guest_inode(parent.into())?;
-        let mut entry = self.inner.lookup(ctx, host_parent.into(), name)?;
+        let host_parent = self.map_guest_inode(parent)?;
+        let mut entry = self.inner.lookup(ctx, host_parent, name)?;
         let host_inode = entry.inode;
         
-        // Return existing guest inode if already mapped, otherwise record new mapping.
-        // For lookup, guest handles assigning inodes? No, backend assigns.
-        // Actually, during restore, we want to map MUST map host_inode -> guest_inode.
-        // For new lookups, we just use the host_inode as guest_inode.
-        let mut h2g = self.host_to_guest_inodes.lock().unwrap();
+        let h2g = self.host_to_guest_inodes.lock().unwrap();
         let guest_inode = if let Some(g) = h2g.get(&host_inode) {
             *g
         } else {
             drop(h2g);
-            self.map_host_inode(host_inode, host_inode);
-            host_inode
+            let guest_inode = host_inode; // Simplified mapping for now, but registered
+            self.map_host_inode(host_inode, guest_inode);
+            guest_inode
         };
         
         entry.inode = guest_inode;
-        self.insert_node_mapping(guest_inode, parent.into(), name);
+        self.insert_node_mapping(guest_inode, parent, name);
         Ok(entry)
     }
 
     fn forget(&self, ctx: &Context, inode: Self::Inode, count: u64) {
-        if let Ok(host_inode) = self.map_guest_inode(inode.into()) {
-            self.inner.forget(ctx, host_inode.into(), count);
+        if let Ok(host_inode) = self.map_guest_inode(inode) {
+            self.inner.forget(ctx, host_inode, count);
         }
     }
 
@@ -327,24 +335,22 @@ impl<F: FileSystem + Send + Sync> FileSystem for TrackingFileSystem<F> {
         flags: u32,
         fuse_flags: u32,
     ) -> io::Result<(Option<Self::Handle>, OpenOptions, Option<u32>)> {
-        let host_inode = self.map_guest_inode(inode.into())?;
-        let (handle, opts, passthrough_open) = self.inner.open(ctx, host_inode.into(), flags, fuse_flags)?;
+        let host_inode = self.map_guest_inode(inode)?;
+        let (handle, opts, p_open) = self.inner.open(ctx, host_inode, flags, fuse_flags)?;
         
-        if let Some(h) = handle {
-            let host_fh = h.into();
-            let guest_fh = host_fh;
-            self.map_host_handle(host_fh, guest_fh);
+        let guest_fh = if let Some(h) = handle {
+            self.map_host_handle(h, h);
             let mut state = self.state.lock().unwrap();
-            state.handles.insert(
-                guest_fh,
-                HandleState {
-                    nodeid: inode.into(),
-                    flags,
-                    is_dir: false,
-                },
-            );
-        }
-        Ok((handle, opts, passthrough_open))
+            state.handles.insert(h, HandleState {
+                nodeid: inode,
+                flags,
+                is_dir: false,
+            });
+            Some(h)
+        } else {
+            None
+        };
+        Ok((guest_fh, opts, p_open))
     }
 
     fn opendir(
@@ -353,23 +359,22 @@ impl<F: FileSystem + Send + Sync> FileSystem for TrackingFileSystem<F> {
         inode: Self::Inode,
         flags: u32,
     ) -> io::Result<(Option<Self::Handle>, OpenOptions)> {
-        let host_inode = self.map_guest_inode(inode.into())?;
-        let (handle, opts) = self.inner.opendir(ctx, host_inode.into(), flags)?;
-        if let Some(h) = handle {
-            let host_fh = h.into();
-            let guest_fh = host_fh;
-            self.map_host_handle(host_fh, guest_fh);
+        let host_inode = self.map_guest_inode(inode)?;
+        let (handle, opts) = self.inner.opendir(ctx, host_inode, flags)?;
+        
+        let guest_fh = if let Some(h) = handle {
+            self.map_host_handle(h, h);
             let mut state = self.state.lock().unwrap();
-            state.handles.insert(
-                guest_fh,
-                HandleState {
-                    nodeid: inode.into(),
-                    flags,
-                    is_dir: true,
-                },
-            );
-        }
-        Ok((handle, opts))
+            state.handles.insert(h, HandleState {
+                nodeid: inode,
+                flags,
+                is_dir: true,
+            });
+            Some(h)
+        } else {
+            None
+        };
+        Ok((guest_fh, opts))
     }
 
     fn release(
@@ -382,16 +387,13 @@ impl<F: FileSystem + Send + Sync> FileSystem for TrackingFileSystem<F> {
         flock: bool,
         lock_owner: Option<u64>,
     ) -> io::Result<()> {
-        let guest_fh = handle.into();
-        let host_fh = self.map_guest_handle(guest_fh)?;
-        let host_inode = self.map_guest_inode(inode.into())?;
+        let host_inode = self.map_guest_inode(inode)?;
+        let host_handle = self.map_guest_handle(handle);
         
-        self.inner
-            .release(ctx, host_inode.into(), flags, host_fh.into(), flush, flock, lock_owner)?;
+        self.inner.release(ctx, host_inode, flags, host_handle, flush, flock, lock_owner)?;
         
-        self.remove_handle_mapping(guest_fh);
-        let mut state = self.state.lock().unwrap();
-        state.handles.remove(&guest_fh);
+        self.remove_handle_mapping(handle);
+        self.state.lock().unwrap().handles.remove(&handle);
         Ok(())
     }
 
@@ -402,15 +404,13 @@ impl<F: FileSystem + Send + Sync> FileSystem for TrackingFileSystem<F> {
         flags: u32,
         handle: Self::Handle,
     ) -> io::Result<()> {
-        let guest_fh = handle.into();
-        let host_fh = self.map_guest_handle(guest_fh)?;
-        let host_inode = self.map_guest_inode(inode.into())?;
+        let host_inode = self.map_guest_inode(inode)?;
+        let host_handle = self.map_guest_handle(handle);
         
-        self.inner.releasedir(ctx, host_inode.into(), flags, host_fh.into())?;
+        self.inner.releasedir(ctx, host_inode, flags, host_handle)?;
         
-        self.remove_handle_mapping(guest_fh);
-        let mut state = self.state.lock().unwrap();
-        state.handles.remove(&guest_fh);
+        self.remove_handle_mapping(handle);
+        self.state.lock().unwrap().handles.remove(&handle);
         Ok(())
     }
 
@@ -419,31 +419,25 @@ impl<F: FileSystem + Send + Sync> FileSystem for TrackingFileSystem<F> {
         ctx: &Context,
         parent: Self::Inode,
         name: &CStr,
-        args: CreateIn,
+        args: fuse_backend_rs::abi::fuse_abi::CreateIn,
     ) -> io::Result<(Entry, Option<Self::Handle>, OpenOptions, Option<u32>)> {
-        let host_parent = self.map_guest_inode(parent.into())?;
-        let (mut entry, handle, opts, passthrough_open) = self.inner.create(ctx, host_parent.into(), name, args)?;
+        let host_parent = self.map_guest_inode(parent)?;
+        let (mut entry, handle, opts, p_open) = self.inner.create(ctx, host_parent, name, args)?;
         
         let host_inode = entry.inode;
         self.map_host_inode(host_inode, host_inode);
         entry.inode = host_inode;
         
-        self.insert_node_mapping(host_inode, parent.into(), name);
+        self.insert_node_mapping(host_inode, parent, name);
         if let Some(h) = handle {
-            let host_fh = h.into();
-            let guest_fh = host_fh;
-            self.map_host_handle(host_fh, guest_fh);
-            let mut state = self.state.lock().unwrap();
-            state.handles.insert(
-                guest_fh,
-                HandleState {
-                    nodeid: host_inode,
-                    flags: args.flags,
-                    is_dir: false,
-                },
-            );
+            self.map_host_handle(h, h);
+            self.state.lock().unwrap().handles.insert(h, HandleState {
+                nodeid: host_inode,
+                flags: args.flags,
+                is_dir: false,
+            });
         }
-        Ok((entry, handle, opts, passthrough_open))
+        Ok((entry, handle, opts, p_open))
     }
 
     fn mkdir(
@@ -454,26 +448,26 @@ impl<F: FileSystem + Send + Sync> FileSystem for TrackingFileSystem<F> {
         mode: u32,
         umask: u32,
     ) -> io::Result<Entry> {
-        let host_parent = self.map_guest_inode(parent.into())?;
-        let mut entry = self.inner.mkdir(ctx, host_parent.into(), name, mode, umask)?;
+        let host_parent = self.map_guest_inode(parent)?;
+        let mut entry = self.inner.mkdir(ctx, host_parent, name, mode, umask)?;
         let host_inode = entry.inode;
         self.map_host_inode(host_inode, host_inode);
         entry.inode = host_inode;
-        self.insert_node_mapping(host_inode, parent.into(), name);
+        self.insert_node_mapping(host_inode, parent, name);
         Ok(entry)
     }
 
     fn unlink(&self, ctx: &Context, parent: Self::Inode, name: &CStr) -> io::Result<()> {
-        let host_parent = self.map_guest_inode(parent.into())?;
-        self.inner.unlink(ctx, host_parent.into(), name)?;
-        self.remove_node_mapping(parent.into(), name);
+        let host_parent = self.map_guest_inode(parent)?;
+        self.inner.unlink(ctx, host_parent, name)?;
+        self.remove_node_mapping(parent, name); // Corrected to use parent guest inode
         Ok(())
     }
 
     fn rmdir(&self, ctx: &Context, parent: Self::Inode, name: &CStr) -> io::Result<()> {
-        let host_parent = self.map_guest_inode(parent.into())?;
-        self.inner.rmdir(ctx, host_parent.into(), name)?;
-        self.remove_node_mapping(parent.into(), name);
+        let host_parent = self.map_guest_inode(parent)?;
+        self.inner.rmdir(ctx, host_parent, name)?;
+        self.remove_node_mapping(parent, name);
         Ok(())
     }
 
@@ -486,11 +480,10 @@ impl<F: FileSystem + Send + Sync> FileSystem for TrackingFileSystem<F> {
         newname: &CStr,
         flags: u32,
     ) -> io::Result<()> {
-        let host_olddir = self.map_guest_inode(olddir.into())?;
-        let host_newdir = self.map_guest_inode(newdir.into())?;
-        self.inner
-            .rename(ctx, host_olddir.into(), oldname, host_newdir.into(), newname, flags)?;
-        self.update_node_mapping(olddir.into(), oldname, newdir.into(), newname);
+        let host_olddir = self.map_guest_inode(olddir)?;
+        let host_newdir = self.map_guest_inode(newdir)?;
+        self.inner.rename(ctx, host_olddir, oldname, host_newdir, newname, flags)?;
+        self.update_node_mapping(olddir, oldname, newdir, newname);
         Ok(())
     }
 
@@ -499,14 +492,10 @@ impl<F: FileSystem + Send + Sync> FileSystem for TrackingFileSystem<F> {
         ctx: &Context,
         inode: Self::Inode,
         handle: Option<Self::Handle>,
-    ) -> io::Result<(libc::stat64, u64)> {
-        let host_inode = self.map_guest_inode(inode.into())?;
-        let host_handle = if let Some(h) = handle {
-            Some(self.map_guest_handle(h.into())?.into())
-        } else {
-            None
-        };
-        self.inner.getattr(ctx, host_inode.into(), host_handle)
+    ) -> io::Result<(libc::stat64, Duration)> {
+        let host_inode = self.map_guest_inode(inode)?;
+        let host_handle = handle.map(|h| self.map_guest_handle(h));
+        self.inner.getattr(ctx, host_inode, host_handle)
     }
 
     fn read(
@@ -520,10 +509,19 @@ impl<F: FileSystem + Send + Sync> FileSystem for TrackingFileSystem<F> {
         lock_owner: Option<u64>,
         flags: u32,
     ) -> io::Result<usize> {
-        let host_inode = self.map_guest_inode(inode.into())?;
-        let host_handle = self.map_guest_handle(handle.into())?;
-        self.inner
-            .read(ctx, host_inode.into(), host_handle.into(), w, size, offset, lock_owner, flags)
+        let host_inode = self.map_guest_inode(inode)?;
+        let host_handle = self.map_guest_handle(handle);
+        
+        if host_handle == 0 {
+            let (temp_handle, _, _) = self.inner.open(ctx, host_inode, libc::O_RDONLY as u32, 0)?;
+            if let Some(h) = temp_handle {
+                let res = self.inner.read(ctx, host_inode, h, w, size, offset, lock_owner, flags);
+                let _ = self.inner.release(ctx, host_inode, libc::O_RDONLY as u32, h, false, false, None);
+                return res;
+            }
+        }
+        
+        self.inner.read(ctx, host_inode, host_handle, w, size, offset, lock_owner, flags)
     }
 
     fn write(
@@ -539,20 +537,20 @@ impl<F: FileSystem + Send + Sync> FileSystem for TrackingFileSystem<F> {
         flags: u32,
         fuse_flags: u32,
     ) -> io::Result<usize> {
-        let host_inode = self.map_guest_inode(inode.into())?;
-        let host_handle = self.map_guest_handle(handle.into())?;
-        self.inner.write(
-            ctx,
-            host_inode.into(),
-            host_handle.into(),
-            r,
-            size,
-            offset,
-            lock_owner,
-            delayed_write,
-            flags,
-            fuse_flags,
-        )
+        let host_inode = self.map_guest_inode(inode)?;
+        let host_handle = self.map_guest_handle(handle);
+        
+        if host_handle == 0 {
+            // Use O_RDWR for safety on transient write
+            let (temp_handle, _, _) = self.inner.open(ctx, host_inode, libc::O_RDWR as u32, 0)?;
+            if let Some(h) = temp_handle {
+                let res = self.inner.write(ctx, host_inode, h, r, size, offset, lock_owner, delayed_write, flags, fuse_flags);
+                let _ = self.inner.release(ctx, host_inode, libc::O_RDWR as u32, h, true, false, None);
+                return res;
+            }
+        }
+        
+        self.inner.write(ctx, host_inode, host_handle, r, size, offset, lock_owner, delayed_write, flags, fuse_flags)
     }
 
     fn readdir(
@@ -562,12 +560,157 @@ impl<F: FileSystem + Send + Sync> FileSystem for TrackingFileSystem<F> {
         handle: Self::Handle,
         size: u32,
         offset: u64,
-        add_entry: &mut dyn FnMut(DirEntry) -> io::Result<usize>,
+        add_entry: &mut dyn FnMut(DirEntry) -> std::result::Result<usize, std::io::Error>,
+    ) -> std::result::Result<(), std::io::Error> {
+        let host_inode = self.map_guest_inode(inode)?;
+        let host_handle = self.map_guest_handle(handle);
+        
+        // If handle is 0, it means we don't have a valid host file descriptor.
+        // We should try to open it temporarily.
+        if host_handle == 0 {
+            let (temp_handle, _) = self.inner.opendir(ctx, host_inode, 0)?;
+            if let Some(h) = temp_handle {
+                let mut wrapped_add_entry = |mut dir_entry: DirEntry| {
+                    let host_ino = dir_entry.ino;
+                    let h2g = self.host_to_guest_inodes.lock().unwrap();
+                    let guest_ino = if let Some(g) = h2g.get(&host_ino) {
+                        *g
+                    } else {
+                        drop(h2g);
+                        self.map_host_inode(host_ino, host_ino);
+                        host_ino
+                    };
+                    dir_entry.ino = guest_ino;
+                    add_entry(dir_entry)
+                };
+                let res = self.inner.readdir(ctx, host_inode, h, size, offset, &mut wrapped_add_entry);
+                let _ = self.inner.releasedir(ctx, host_inode, 0, h);
+                return res;
+            }
+        }
+
+        let mut wrapped_add_entry = |mut dir_entry: DirEntry| {
+            let host_ino = dir_entry.ino;
+            let h2g = self.host_to_guest_inodes.lock().unwrap();
+            let guest_ino = if let Some(g) = h2g.get(&host_ino) {
+                *g
+            } else {
+                drop(h2g);
+                self.map_host_inode(host_ino, host_ino);
+                host_ino
+            };
+            dir_entry.ino = guest_ino;
+            add_entry(dir_entry)
+        };
+
+        self.inner.readdir(ctx, host_inode, host_handle, size, offset, &mut wrapped_add_entry)
+    }
+
+    fn readdirplus(
+        &self,
+        ctx: &Context,
+        inode: Self::Inode,
+        handle: Self::Handle,
+        size: u32,
+        offset: u64,
+        add_entry: &mut dyn FnMut(DirEntry, Entry) -> std::result::Result<usize, std::io::Error>,
+    ) -> std::result::Result<(), std::io::Error> {
+        let host_inode = self.map_guest_inode(inode)?;
+        let host_handle = self.map_guest_handle(handle);
+
+        if host_handle == 0 {
+            let (temp_handle, _) = self.inner.opendir(ctx, host_inode, 0)?;
+            if let Some(h) = temp_handle {
+                let mut wrapped_add_entry = |mut dir_entry: DirEntry, mut entry: Entry| {
+                    let host_ino = entry.inode;
+                    let h2g = self.host_to_guest_inodes.lock().unwrap();
+                    let guest_ino = if let Some(g) = h2g.get(&host_ino) {
+                        *g
+                    } else {
+                        drop(h2g);
+                        self.map_host_inode(host_ino, host_ino);
+                        host_ino
+                    };
+                    dir_entry.ino = guest_ino;
+                    entry.inode = guest_ino;
+                    add_entry(dir_entry, entry)
+                };
+                let res = self.inner.readdirplus(ctx, host_inode, h, size, offset, &mut wrapped_add_entry);
+                let _ = self.inner.releasedir(ctx, host_inode, 0, h);
+                return res;
+            }
+        }
+
+        let mut wrapped_add_entry = |mut dir_entry: DirEntry, mut entry: Entry| {
+            let host_ino = entry.inode;
+            let h2g = self.host_to_guest_inodes.lock().unwrap();
+            let guest_ino = if let Some(g) = h2g.get(&host_ino) {
+                *g
+            } else {
+                drop(h2g);
+                self.map_host_inode(host_ino, host_ino);
+                host_ino
+            };
+            dir_entry.ino = guest_ino;
+            entry.inode = guest_ino;
+            add_entry(dir_entry, entry)
+        };
+
+        self.inner.readdirplus(ctx, host_inode, host_handle, size, offset, &mut wrapped_add_entry)
+    }
+
+    fn setattr(
+        &self,
+        ctx: &Context,
+        inode: Self::Inode,
+        attr: libc::stat64,
+        handle: Option<Self::Handle>,
+        valid: fuse_backend_rs::api::filesystem::SetattrValid,
+    ) -> io::Result<(libc::stat64, Duration)> {
+        let host_inode = self.map_guest_inode(inode)?;
+        let host_handle = handle.map(|h| self.map_guest_handle(h)).filter(|&h| h != 0);
+        self.inner.setattr(ctx, host_inode, attr, host_handle, valid)
+    }
+
+    fn fsync(
+        &self,
+        ctx: &Context,
+        inode: Self::Inode,
+        datasync: bool,
+        handle: Self::Handle,
     ) -> io::Result<()> {
-        let host_inode = self.map_guest_inode(inode.into())?;
-        let host_handle = self.map_guest_handle(handle.into())?;
-        self.inner
-            .readdir(ctx, host_inode.into(), host_handle.into(), size, offset, add_entry)
+        let host_inode = self.map_guest_inode(inode)?;
+        let host_handle = self.map_guest_handle(handle);
+        
+        if host_handle == 0 {
+            let (temp_handle, _, _) = self.inner.open(ctx, host_inode, libc::O_RDONLY as u32, 0)?;
+            if let Some(h) = temp_handle {
+                let res = self.inner.fsync(ctx, host_inode, datasync, h);
+                let _ = self.inner.release(ctx, host_inode, libc::O_RDONLY as u32, h, false, false, None);
+                return res;
+            }
+        }
+        
+        self.inner.fsync(ctx, host_inode, datasync, host_handle)
+    }
+
+
+    fn init(&self, opts: fuse_backend_rs::abi::fuse_abi::FsOptions) -> io::Result<fuse_backend_rs::abi::fuse_abi::FsOptions> {
+        self.inner.init(opts)
+    }
+
+    fn destroy(&self) {
+        self.inner.destroy()
+    }
+}
+
+impl<F: FileSystem<Inode = u64, Handle = u64> + BackendFileSystem + Send + Sync + 'static> BackendFileSystem for TrackingFileSystem<F> {
+    fn mount(&self) -> io::Result<(Entry, u64)> {
+        self.inner.mount()
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 
@@ -586,14 +729,9 @@ impl FsHandler {
         let mem = self.mem.memory();
         let queue = &mut self.queues[queue_index];
         let mut used_descs = false;
-        let mut iter = queue
-            .iter(mem.deref())
-            .map_err(DeviceError::QueueIterator)?;
-
-        for desc_chain in &mut iter {
+        while let Some(desc_chain) = queue.pop_descriptor_chain(mem.deref()) {
             let head_index = desc_chain.head_index();
-
-            let reader = Reader::from_descriptor_chain(&mem, desc_chain.clone()).map_err(|e| {
+            let reader = Reader::from_descriptor_chain(mem.deref(), desc_chain.clone()).map_err(|e| {
                 error!("failed to create reader: {}", e);
                 DeviceError::IoError(io::Error::new(io::ErrorKind::Other, e))
             })?;
@@ -639,7 +777,7 @@ impl EpollHelperHandler for FsHandler {
     fn handle_event(
         &mut self,
         _helper: &mut EpollHelper,
-        event: &vmm_sys_util::epoll::Event,
+        event: &epoll::Event,
     ) -> result::Result<(), EpollHelperError> {
         let ev_type = event.data as u16;
         match ev_type {
@@ -654,7 +792,7 @@ impl EpollHelperHandler for FsHandler {
                     }
                     Err(e) => {
                         error!("Failed to process queue {}: {:?}", queue_index, e);
-                        return Err(EpollHelperError::HandleEvent(anyhow!(e)));
+                        return Err(EpollHelperError::HandleEvent(anyhow::Error::from(e)));
                     }
                 }
             }
@@ -681,7 +819,6 @@ pub struct Fs {
 pub struct FsState {
     pub avail_features: u64,
     pub acked_features: u64,
-    pub config: VirtioFsConfig,
     pub queue_sizes: Vec<u16>,
     pub backend: BackendState,
 }
@@ -717,7 +854,10 @@ impl Fs {
                 (
                     state.avail_features,
                     state.acked_features,
-                    state.config,
+                    VirtioFsConfig {
+                        tag: fs_tag,
+                        num_request_queues: req_num_queues as u32,
+                    },
                     state.queue_sizes,
                     Arc::new(Mutex::new(state.backend)),
                     true,
@@ -740,13 +880,28 @@ impl Fs {
             no_writeback: !writeback,
             ..VfsOptions::default()
         }));
+        info!("Native Virtio-FS: Opening shared directory: {:?}", shared_dir);
+        // Sanity check: Can the host process read this directory?
+        match std::fs::read_dir(&shared_dir) {
+            Ok(entries) => {
+                let count = entries.count();
+                info!("Native Virtio-FS: Sanity check success. Found {} entries in {:?}", count, shared_dir);
+            }
+            Err(e) => {
+                error!("Native Virtio-FS: HOST SANITY CHECK FAILED for {:?}: {}", shared_dir, e);
+            }
+        }
+
         let passthrough_cfg = PassthroughConfig {
             root_dir: shared_dir.to_str().unwrap().to_string(),
             cache_policy: backend_cache_policy,
             writeback,
+            inode_file_handles: false, // Force disable file handles for WSL2 compatibility
             ..Default::default()
         };
-        let inner_fs = PassthroughFs::new(passthrough_cfg)
+        let inner_fs = PassthroughFs::<()>::new(passthrough_cfg)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        inner_fs.import()
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
         let tracking_fs = TrackingFileSystem::new(inner_fs, backend_state.clone());
@@ -783,7 +938,6 @@ impl Fs {
         FsState {
             avail_features: self.common.avail_features,
             acked_features: self.common.acked_features,
-            config: self.config,
             queue_sizes: self.common.queue_sizes.clone(),
             backend: self.backend_state.lock().unwrap().clone(),
         }
@@ -889,8 +1043,6 @@ impl Snapshottable for Fs {
     }
 }
 impl Transportable for Fs {}
-impl Migratable for Fs {
-    fn set_paused(&mut self, paused: bool) -> std::result::Result<(), MigratableError> {
-        if paused { self.pause() } else { self.resume() }
-    }
-}
+impl Migratable for Fs {}
+
+

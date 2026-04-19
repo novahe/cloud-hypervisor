@@ -29,6 +29,7 @@ pub enum Thread {
     VirtioVhostNetCtl,
     VirtioVsock,
     VirtioWatchdog,
+    VirtioFs,
 }
 
 /// Shorthand for chaining `SeccompCondition`s with the `and` operator  in a `SeccompRule`.
@@ -296,6 +297,7 @@ fn get_seccomp_rules(thread_type: Thread) -> Vec<(i64, Vec<SeccompRule>)> {
         Thread::VirtioVhostNetCtl => virtio_vhost_net_ctl_thread_rules(),
         Thread::VirtioVsock => virtio_vsock_thread_rules(),
         Thread::VirtioWatchdog => virtio_watchdog_thread_rules(),
+        Thread::VirtioFs => virtio_fs_thread_rules(),
     };
     rules.append(&mut virtio_thread_common());
     rules
@@ -354,4 +356,33 @@ pub fn get_seccomp_filter(
         .and_then(|filter| filter.try_into())
         .map_err(Error::Backend),
     }
+}
+
+fn virtio_fs_thread_rules() -> Vec<(i64, Vec<SeccompRule>)> {
+    vec![
+        (libc::SYS_clock_nanosleep, vec![]),
+        (libc::SYS_nanosleep, vec![]),
+        (libc::SYS_pread64, vec![]),
+        (libc::SYS_pwrite64, vec![]),
+        (libc::SYS_fstat, vec![]),
+        (libc::SYS_newfstatat, vec![]),
+        (libc::SYS_openat, vec![]),
+        (libc::SYS_close, vec![]),
+        (libc::SYS_read, vec![]),
+        (libc::SYS_write, vec![]),
+        (libc::SYS_lseek, vec![]),
+        (libc::SYS_fsync, vec![]),
+        (libc::SYS_fdatasync, vec![]),
+        (libc::SYS_getdents64, vec![]),
+        (libc::SYS_mkdirat, vec![]),
+        (libc::SYS_unlinkat, vec![]),
+        (libc::SYS_renameat2, vec![]),
+        (libc::SYS_ftruncate, vec![]),
+        (libc::SYS_fallocate, vec![]),
+        (libc::SYS_fchmodat, vec![]),
+        (libc::SYS_fchownat, vec![]),
+        (libc::SYS_utimensat, vec![]),
+        (libc::SYS_flock, vec![]),
+        (libc::SYS_fcntl, vec![]),
+    ]
 }

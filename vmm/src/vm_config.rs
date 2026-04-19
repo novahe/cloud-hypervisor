@@ -1,6 +1,7 @@
 // Copyright © 2022 Intel Corporation
 //
 // SPDX-License-Identifier: Apache-2.0
+use std::str::FromStr;
 //
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
